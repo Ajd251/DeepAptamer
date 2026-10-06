@@ -2,6 +2,7 @@
 
 Run with:  streamlit run app.py
 """
+import json
 import os
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from deepaptamer import metrics as metrics_mod
 from deepaptamer.features import encode, encode_chunks
 from deepaptamer.models import MODELS, inputs_for, load, predict
 from deepaptamer.prep import parse_reads, prepare, to_tsv
+from deepaptamer.shape import SEQ_LEN
 
 REPO = Path(__file__).resolve().parent
 RUNS = REPO / "runs"
@@ -38,9 +40,20 @@ st.set_page_config(page_title="DeepAptamer", page_icon="\N{DNA DOUBLE HELIX}", l
 
 
 @st.cache_resource(show_spinner=False)
-def get_model(name, weights_path, mtime):
+def get_model(name, weights_path, mtime, length):
     """mtime is in the cache key so retrained weights at the same path reload."""
-    return load(name, weights_path)
+    return load(name, weights_path, length=length)
+
+
+def weights_length(weights_dir):
+    """The length a weight set was trained at; the supplied models predate meta.json."""
+    meta = Path(weights_dir) / "meta.json"
+    if meta.exists():
+        try:
+            return int(json.loads(meta.read_text()).get("length", SEQ_LEN))
+        except (ValueError, OSError):
+            pass
+    return SEQ_LEN
 
 
 def available_weight_sets():
@@ -59,7 +72,15 @@ def models_in(weights_dir):
 def score_sequences(seqs, weights_dir, status, bar):
     """Encode and score in blocks so memory stays flat on a big library."""
     found = models_in(weights_dir)
-    loaded = {MODELS[n][0]: get_model(n, str(p), p.stat().st_mtime) for n, p in found.items()}
+    L = weights_length(weights_dir)
+    bad = [s for s in seqs if len(s) != L]
+    if bad:
+        raise ValueError(
+            f"This model was trained on {L}-nt sequences, but {len(bad):,} of your "
+            f"{len(seqs):,} are a different length (first is {len(bad[0])} nt). Weights only "
+            f"work at the length they were trained on — train a model on your own data instead."
+        )
+    loaded = {MODELS[n][0]: get_model(n, str(p), p.stat().st_mtime, L) for n, p in found.items()}
     scores = {label: [] for label in loaded}
     done = 0
     for onehot, shape in encode_chunks(seqs, CHUNK):
@@ -230,10 +251,13 @@ with tab_score:
 
         if rows and st.button("Score", type="primary", key="score_go"):
             seqs = [s for s, _ in rows]
-            est = len(seqs) / 1400 + len(seqs) / 5000
-            st.caption(f"{len(seqs):,} sequences — roughly {max(1, round(est / 60))} min")
             bar, status = st.progress(0.0), st.empty()
-            scores = score_sequences(seqs, weights_dir, status, bar)
+            try:
+                scores = score_sequences(seqs, weights_dir, status, bar)
+            except ValueError as e:
+                bar.empty(); status.empty()
+                st.error(str(e))
+                st.stop()
             status.empty()
             out = pd.DataFrame({"sequence": seqs, "count": [c for _, c in rows], **scores})
             headline = "DeepAptamer" if "DeepAptamer" in scores else list(scores)[0]
@@ -285,6 +309,12 @@ with tab_train:
         chosen = st.multiselect("Models to train", list(MODELS),
                                 default=list(MODELS),
                                 format_func=lambda k: MODELS[k][0])
+        split_mode = st.radio(
+            "How to hold out the test set", ["Family-aware (recommended)", "Random"],
+            horizontal=True, key="split_mode",
+            help="SELEX enriches families of near-identical sequences. A random split puts "
+                 "relatives in both train and test, so the score flatters the model. "
+                 "Family-aware keeps each family wholly on one side.")
 
         if int(pos) + int(neg) > n:
             st.error(f"Binders + non-binders ({int(pos) + int(neg):,}) exceeds the "
@@ -302,15 +332,45 @@ with tab_train:
 
             bar, status = st.progress(0.0), st.empty()
             status.write("Encoding sequences ...")
-            blocks = list(encode_chunks(seqs, CHUNK,
-                                        progress=lambda d, t: bar.progress(d / t)))
+            try:
+                blocks = list(encode_chunks(seqs, CHUNK,
+                                            progress=lambda d, t: bar.progress(d / t)))
+            except ValueError as e:
+                st.error(str(e))
+                st.stop()
             onehot = np.concatenate([b[0] for b in blocks])
             shape = np.concatenate([b[1] for b in blocks])
-            Xo_tr, Xo_te, Xs_tr, Xs_te, y_tr, y_te = train_test_split(
-                onehot, shape, labels, test_size=0.1, random_state=42)
+            L = onehot.shape[1]
+
+            if split_mode.startswith("Family"):
+                from deepaptamer.cluster import family_split
+
+                status.write("Grouping sequences into families ...")
+                tr, te, groups = family_split(seqs)
+                st.caption(f"{len(set(groups)):,} families among {len(seqs):,} sequences; "
+                           f"{len(tr):,} train / {len(te):,} test, no family spanning both.")
+            else:
+                tr, te = train_test_split(np.arange(len(seqs)), test_size=0.1, random_state=42)
+
+            from deepaptamer.cluster import leakage_report
+
+            rep = leakage_report(seqs, tr, te, labels)
+            if rep and rep["leaky"]:
+                st.warning(
+                    f"Held-out binders sit a median of {rep['median']} of {L} mutations from the "
+                    f"nearest training sequence ({rep['within_2']} of {rep['n']} within 2). These "
+                    f"scores largely measure recall of memorised sequences. Use a family-aware "
+                    f"split for a number that reflects novel sequences.")
+
+            Xo_tr, Xo_te, Xs_tr, Xs_te = onehot[tr], onehot[te], shape[tr], shape[te]
+            y_tr, y_te = labels[tr], labels[te]
             y_onehot = keras.utils.to_categorical(y_tr, 2)
 
             out_dir = RUNS / name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "meta.json").write_text(json.dumps(
+                {"length": int(L), "split": "family" if split_mode.startswith("Family") else "random"},
+                indent=2))
             scores = {}
 
             class Progress(keras.callbacks.Callback):
@@ -329,13 +389,14 @@ with tab_train:
             for key in chosen:
                 label, build = MODELS[key]
                 bar.progress(0.0)
-                model = build()
+                model = build(length=L)
                 model.fit(inputs_for(model, Xo_tr, Xs_tr), y_onehot, batch_size=256,
                           epochs=int(epochs), validation_split=0.1, verbose=0,
                           callbacks=[Progress(label, int(epochs))])
                 (out_dir / key).mkdir(parents=True, exist_ok=True)
                 model.save_weights(out_dir / key / "model.h5")
-                scores[label] = predict(load(key, out_dir / key / "model.h5"), Xo_te, Xs_te)
+                scores[label] = predict(
+                    load(key, out_dir / key / "model.h5", length=L), Xo_te, Xs_te)
 
             status.empty()
             bar.empty()

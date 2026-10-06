@@ -132,13 +132,25 @@ The values are AUROC. The DKK1 weights in `model/DKK1` do not reproduce the publ
   the plain BiLSTM 0.909 to 0.905; on BCMA the BiLSTM wins outright. The paper's margins were
   also obtained by searching the non-binder count until DeepAptamer beat the baselines on the
   *test* split (`tune()` in `script/main.py`), so treat the hybrid's advantage as unproven.
-- **Held-out scores are optimistic, badly so for BCMA.** SELEX enriches families of near-identical
-  sequences, and a random 90/10 split puts siblings on both sides. The median held-out BCMA binder
-  sits 1 mutation from a training sequence (CTGF: 10). Expect worse performance on sequences
-  unlike anything in training, and prefer the CTGF-style numbers as the honest guide.
+- **A random split leaks, mildly.** SELEX enriches families of near-identical sequences, and a
+  random 90/10 split puts siblings on both sides: the median held-out BCMA binder sits 1 mutation
+  from a training sequence (CTGF is clean, at 10). Measured cost on BCMA, retraining with whole
+  families held out, is 0.990 → 0.968 AUROC for the CNN and 0.986 → 0.981 for the BiLSTM — real
+  but modest, because held-out families still share the underlying motif. Use `--split family`
+  when you want the honest number; every run reports the distance either way.
+- **DeepAptamer is unstable to retrain.** In repeated runs from scratch it collapsed to predicting
+  a single class about half the time (AUROC ~0.50), while the CNN and BiLSTM trained reliably every
+  time. The supplied weights are fine; reproducing them is not dependable. Train all three and
+  compare rather than assuming the hybrid.
 - **A score is "looks enriched", not "binds tightly".** Enrichment is a proxy for affinity that
   also reflects PCR bias and amplification; validate hits experimentally.
-- **Inputs are fixed at 35 nt.** Both the architecture and the shape features assume this length.
+- **Sequences must all be the same length, but it need not be 35 nt.** The supplied weights are
+  35-nt models and will not score anything else — the CNN cannot even load, and the other two
+  would load and return confident nonsense, so that is refused. Train your own at any length from
+  about 29 nt upward (shorter still works for the CNN and BiLSTM) and the pipeline adapts: the
+  shape encoding is a 5-/6-mer lookup with no length of its own, giving `4L − 14` values, and
+  `train` records the length in `runs/<name>/meta.json` so `predict` picks it up automatically.
+  Verified against DNAshapeR at 20, 45 and 60 nt.
 - **The attention layer mixes batches.** In the original model it mixes each sequence with the
   others in its batch, so a sequence's score depended on its batch-mates (by up to 0.6 in testing).
   This package scores every sequence on its own, which is the same as a batch of one, so a score
