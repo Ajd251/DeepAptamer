@@ -1,0 +1,10 @@
+# Used by Streamlit Community Cloud, and by `pip install -r requirements.txt` anywhere.
+# tensorflow-cpu keeps the install small; the models are tiny and there is no GPU on the free tier.
+tensorflow-cpu==2.21.0
+tf-keras==2.21.0
+numpy==2.4.6
+scikit-learn==1.9.1
+pandas==3.0.6
+altair==6.3.0
+streamlit==1.65.0
+matplotlib==3.11.2
