@@ -7,6 +7,7 @@
 """
 import argparse
 import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ import numpy as np
 from . import metrics as metrics_mod
 from .features import encode, read_sequences
 from .models import MODELS, inputs_for, load, predict
+from .shape import SEQ_LEN
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -61,18 +63,53 @@ def warn_about_ties(counts, pos, neg):
                   f"count {value:g}; which of them are used depends on the order of your file.")
 
 
-def load_split(seqs_path, pos, neg):
-    """The paper's setup: top `pos` sequences are binders, bottom `neg` are not, 90/10 split."""
+def load_split(seqs_path, pos, neg, split="random"):
+    """Top `pos` sequences are binders, bottom `neg` are not, then a 90/10 split.
+
+    `split="random"` is what the paper did and what the supplied weights were trained on.
+    `split="family"` keeps near-identical sequences on one side, which is the honest setting
+    for judging how a model will do on sequences it has not seen relatives of.
+    """
     from sklearn.model_selection import train_test_split
 
     seqs, counts = read_ranked(seqs_path)
     if pos + neg > len(seqs):
         sys.exit(f"{seqs_path} has {len(seqs)} sequences, fewer than --pos + --neg = {pos + neg}.")
     warn_about_ties(counts, pos, neg)
-    print(f"Encoding {pos} binders + {neg} non-binders from {seqs_path} ...")
-    onehot, shape = encode(seqs[:pos] + seqs[len(seqs) - neg:])
+    chosen = seqs[:pos] + seqs[len(seqs) - neg:]
     labels = np.array([1] * pos + [0] * neg)
-    return train_test_split(onehot, shape, labels, test_size=0.1, random_state=42)
+    print(f"Encoding {pos} binders + {neg} non-binders from {seqs_path} ...")
+    onehot, shape = encode(chosen)
+
+    if split == "family":
+        from .cluster import family_split
+
+        print("Grouping into families ...")
+        tr, te, groups = family_split(chosen)
+        print(f"{len(set(groups))} families among {len(chosen)} sequences; "
+              f"{len(tr)} train / {len(te)} test, no family spanning both.")
+    else:
+        idx = np.arange(len(chosen))
+        tr, te = train_test_split(idx, test_size=0.1, random_state=42)
+
+    report_leakage(chosen, tr, te, labels)
+    return (onehot[tr], onehot[te], shape[tr], shape[te], labels[tr], labels[te])
+
+
+def report_leakage(seqs, train_idx, test_idx, labels):
+    from .cluster import leakage_report
+
+    r = leakage_report(seqs, train_idx, test_idx, labels)
+    if not r:
+        return
+    msg = (f"Held-out binders sit a median of {r['median']} of {len(seqs[0])} mutations from the nearest "
+           f"training sequence ({r['within_2']} of {r['n']} within 2).")
+    if r["leaky"]:
+        print(f"\nwarning: {msg}\n  Most of the test set has a near-twin in training, so these "
+              f"scores measure recall of memorised sequences, not generalisation.\n"
+              f"  Re-run with --split family for a number that reflects novel sequences.\n")
+    else:
+        print(msg)
 
 
 def report(y, scores, out_dir, title):
@@ -119,6 +156,15 @@ def weight_files(weights_dir):
     return found
 
 
+def weights_length(weights_dir):
+    """The sequence length a weight set was trained at. Written by `train`; 35 for the
+    supplied models, which predate the file."""
+    meta = Path(weights_dir) / "meta.json"
+    if meta.exists():
+        return int(json.loads(meta.read_text()).get("length", SEQ_LEN))
+    return SEQ_LEN
+
+
 def resolve(args):
     """Fill seqs/pos/neg/weights from --target where they weren't given explicitly."""
     preset = TARGETS.get(getattr(args, "target", None), {})
@@ -132,10 +178,12 @@ def cmd_predict(args):
     if args.weights is None:
         sys.exit("Give --target (CTGF or BCMA) or --weights DIR.")
     seqs = read_sequences(args.input)
+    wdir = Path(args.weights)
+    L = weights_length(wdir)
     print(f"Encoding {len(seqs)} sequences from {args.input} ...")
-    onehot, shape = encode(seqs)
-    scores = {MODELS[name][0]: predict(load(name, path), onehot, shape)
-              for name, path in weight_files(Path(args.weights)).items()}
+    onehot, shape = encode(seqs, length=L)
+    scores = {MODELS[name][0]: predict(load(name, path, length=L), onehot, shape)
+              for name, path in weight_files(wdir).items()}
     out = open(args.output, "w", newline="") if args.output else sys.stdout
     w = csv.writer(out, delimiter="\t", lineterminator="\n")
     w.writerow(["sequence"] + list(scores))
@@ -149,7 +197,7 @@ def cmd_predict(args):
 def cmd_evaluate(args):
     if None in (args.seqs, args.pos, args.neg, args.weights):
         sys.exit("Give --target (CTGF or BCMA), or all of --seqs, --pos, --neg and --weights.")
-    _, X_test, _, S_test, _, y_test = load_split(args.seqs, args.pos, args.neg)
+    _, X_test, _, S_test, _, y_test = load_split(args.seqs, args.pos, args.neg, args.split)
     scores = {MODELS[name][0]: predict(load(name, path), X_test, S_test)
               for name, path in weight_files(Path(args.weights)).items()}
     report(y_test, scores, Path(args.out or f"results/{args.target or Path(args.weights).name}"),
@@ -159,20 +207,25 @@ def cmd_evaluate(args):
 def cmd_train(args):
     import tf_keras as keras
 
-    X_train, X_test, S_train, S_test, y_train, y_test = load_split(args.seqs, args.pos, args.neg)
+    X_train, X_test, S_train, S_test, y_train, y_test = load_split(
+        args.seqs, args.pos, args.neg, args.split)
     keras.utils.set_random_seed(args.seed)
     y_onehot = keras.utils.to_categorical(y_train, 2)
     out = Path(args.out)
+    L = X_train.shape[1]
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "meta.json").write_text(json.dumps({"length": L, "split": args.split}, indent=2))
     scores = {}
     for name in args.models:
         label, build = MODELS[name]
-        print(f"\nTraining {label} ({args.epochs} epochs, batch size {args.batch_size}) ...")
-        model = build()
+        print(f"\nTraining {label} at {L} nt ({args.epochs} epochs, "
+              f"batch size {args.batch_size}) ...")
+        model = build(length=L)
         model.fit(inputs_for(model, X_train, S_train), y_onehot, batch_size=args.batch_size,
                   epochs=args.epochs, validation_split=0.1, verbose=2)
         (out / name).mkdir(parents=True, exist_ok=True)
         model.save_weights(out / name / "model.h5")
-        scores[label] = predict(load(name, out / name / "model.h5"), X_test, S_test)
+        scores[label] = predict(load(name, out / name / "model.h5", length=L), X_test, S_test)
     report(y_test, scores, out, Path(args.seqs).stem)
     print(f"Weights saved under {out}/; score new sequences with:\n"
           f"  python -m deepaptamer predict --weights {out} --input <file>")
@@ -197,6 +250,9 @@ def main():
         p.add_argument("--pos", type=int, help="number of top-ranked sequences to label as binders")
         p.add_argument("--neg", type=int, help="number of bottom-ranked sequences to label as non-binders")
         p.add_argument("--out", help="output directory")
+        p.add_argument("--split", choices=["random", "family"], default="random",
+                       help="random (default) reproduces the paper; family keeps near-identical "
+                            "sequences out of the test set and gives an honest estimate")
         p.set_defaults(func=func)
         if name == "evaluate":
             p.add_argument("--target", choices=TARGETS, help="re-run the paper's test for this protein")

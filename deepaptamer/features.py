@@ -7,7 +7,7 @@ DNAshapeR verified to match it exactly, so no R installation is required.
 """
 import numpy as np
 
-from .shape import N_SHAPE, SEQ_LEN, one_hot, shape_features
+from .shape import N_SHAPE, SEQ_LEN, n_shape_for, one_hot, shape_features
 
 
 def read_sequences(path):
@@ -31,20 +31,30 @@ def read_sequences(path):
     return [s.upper() for s in seqs]
 
 
-def validate(seqs):
+def validate(seqs, length=None):
+    """All sequences must be A/C/G/T/N and the same length as each other.
+
+    A model is built for one length, so a mixed-length file is always a mistake. `length` pins
+    the expected value when you already know it (scoring with weights trained at that length).
+    """
+    expected = length or (len(seqs[0]) if seqs else 0)
     for i, s in enumerate(seqs):
-        if len(s) != SEQ_LEN or set(s) - set("ACGTN"):
+        if set(s) - set("ACGTN"):
+            raise ValueError(f"Sequence {i + 1} ({s!r}) contains characters other than A/C/G/T/N.")
+        if len(s) != expected:
             raise ValueError(
-                f"Sequence {i + 1} ({s!r}) is not a {SEQ_LEN}-nt A/C/G/T/N sequence; "
-                f"the models only accept {SEQ_LEN}-nt inputs (pad short reads with trailing N)."
+                f"Sequence {i + 1} is {len(s)} nt but {'the model expects' if length else 'the first sequence is'} "
+                f"{expected} nt. All sequences must be the same length "
+                f"(pad short ones with trailing N)."
             )
 
 
-def encode(seqs, normalize=True):
-    """Return (onehot [n, 35, 4], shape [n, 126, 1]) as float32 arrays."""
-    validate(seqs)
+def encode(seqs, normalize=True, length=None):
+    """Return (onehot [n, L, 4], shape [n, 4L-14, 1]) as float32 arrays."""
+    validate(seqs, length)
     if not seqs:
-        return (np.zeros((0, SEQ_LEN, 4), np.float32), np.zeros((0, N_SHAPE, 1), np.float32))
+        L = length or SEQ_LEN
+        return (np.zeros((0, L, 4), np.float32), np.zeros((0, n_shape_for(L), 1), np.float32))
     return one_hot(seqs), shape_features(seqs, normalize)[:, :, None]
 
 

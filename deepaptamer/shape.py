@@ -18,9 +18,17 @@ from pathlib import Path
 
 import numpy as np
 
-SEQ_LEN = 35
-N_SHAPE = 126
+SEQ_LEN = 35          # what the supplied weights were trained on
+N_SHAPE = 126         # = n_shape_for(35)
 NAMES = ["MGW", "ProT", "Roll", "HelT"]
+
+
+def n_shape_for(length):
+    """Shape values for a sequence of this length: MGW and ProT lose 4 positions to the
+    flanks they need, Roll and HelT are steps and lose 3. Comes to 4L - 14."""
+    if length < 6:
+        raise ValueError(f"need at least 6 nt to compute shape features, got {length}")
+    return 2 * (length - 4) + 2 * (length - 3)
 _BASES = "ACGT"
 
 _T = np.load(Path(__file__).with_name("shape_tables.npz"))
@@ -50,17 +58,21 @@ def _kmer_index(codes, start, k):
 
 
 def shape_features(seqs, normalize=True):
-    """(n, 126) float32 shape features, in DNAshapeR's MGW/ProT/Roll/HelT column order."""
+    """(n, 4L-14) float32 shape features, in DNAshapeR's MGW/ProT/Roll/HelT column order.
+
+    Works at any length: the lookup tables are over 5- and 6-mers, so nothing here is tied to
+    35 nt. Only the supplied weights are.
+    """
     codes = _codes(seqs)
-    if codes.shape[1] != SEQ_LEN:
-        raise ValueError(f"shape features need {SEQ_LEN}-nt sequences, got {codes.shape[1]}")
+    L = codes.shape[1]
+    n_shape_for(L)
     n = len(seqs)
     blocks = []
 
     for s, name in enumerate(NAMES):
         if name in ("MGW", "ProT"):
             table = _T[f"{name}_main"]
-            cols = range(2, SEQ_LEN - 2)                      # 31 positions
+            cols = range(2, L - 2)                            # L-4 positions
             out = np.empty((n, len(cols)), dtype=np.float64)
             for c, j in enumerate(cols):
                 idx, ok = _kmer_index(codes, j - 2, 5)
@@ -70,13 +82,13 @@ def shape_features(seqs, normalize=True):
             # them spans an N, DNAshapeR keeps the other rather than discarding the step, so the
             # single-pentamer tables are the fallback, not the fill.
             main, first, last = (_T[f"{name}_main"], _T[f"{name}_first"], _T[f"{name}_last"])
-            cols = range(1, SEQ_LEN - 2)                      # 32 steps
+            cols = range(1, L - 2)                            # L-3 steps
             out = np.empty((n, len(cols)), dtype=np.float64)
             for c, j in enumerate(cols):
                 left_ok = right_ok = None
                 if j > 1:
                     li, left_ok = _kmer_index(codes, j - 2, 5)
-                if j < SEQ_LEN - 3:
+                if j < L - 3:
                     ri, right_ok = _kmer_index(codes, j - 1, 5)
 
                 if left_ok is None:                            # first step: right pentamer only
@@ -101,7 +113,7 @@ def shape_features(seqs, normalize=True):
 def one_hot(seqs):
     """(n, 35, 4) one-hot, with an all-zero column for N — the same as DNAshapeR's 1-mer block."""
     codes = _codes(seqs)
-    out = np.zeros((len(seqs), SEQ_LEN, 4), dtype=np.float32)
+    out = np.zeros((len(seqs), codes.shape[1], 4), dtype=np.float32)
     rows, cols = np.nonzero(codes >= 0)
     out[rows, cols, codes[rows, cols]] = 1.0
     return out

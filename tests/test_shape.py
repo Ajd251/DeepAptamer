@@ -11,7 +11,7 @@ import pytest
 
 from deepaptamer.features import encode
 from deepaptamer.prep import parse_reads, prepare, revcomp, trim_one
-from deepaptamer.shape import one_hot, shape_features
+from deepaptamer.shape import n_shape_for, one_hot, shape_features
 
 REF = np.load(Path(__file__).with_name("dnashaper_reference.npz"))
 SEQS = [str(s) for s in REF["seqs"]]
@@ -51,10 +51,36 @@ def test_encode_empty():
     assert onehot.shape == (0, 35, 4) and shape.shape == (0, 126, 1)
 
 
-@pytest.mark.parametrize("bad", ["ACGT", "A" * 36, "ACGTX" + "A" * 30])
+@pytest.mark.parametrize("bad", ["ACGT", "ACGTX" + "A" * 30])
 def test_encode_rejects_bad_input(bad):
+    """Too short for a shape window, or not a nucleotide alphabet."""
     with pytest.raises(ValueError):
         encode([bad])
+
+
+def test_encode_rejects_mixed_lengths():
+    with pytest.raises(ValueError, match="same length"):
+        encode(["A" * 35, "A" * 36])
+
+
+def test_encode_rejects_wrong_length_for_a_model():
+    with pytest.raises(ValueError, match="model expects 35"):
+        encode(["A" * 45], length=35)
+
+
+@pytest.mark.parametrize("length", [20, 35, 45, 60])
+def test_encode_works_at_other_lengths(length):
+    """Only the supplied weights are tied to 35 nt; the encoding is not."""
+    seq = ("ACGTGGTCA" * 20)[:length]
+    onehot, shape = encode([seq])
+    assert onehot.shape == (1, length, 4)
+    assert shape.shape == (1, n_shape_for(length), 1)
+
+
+def test_n_shape_formula():
+    assert n_shape_for(35) == 126
+    assert n_shape_for(45) == 166
+    assert all(n_shape_for(L) == 4 * L - 14 for L in range(6, 80))
 
 
 # ---- read preparation ----
